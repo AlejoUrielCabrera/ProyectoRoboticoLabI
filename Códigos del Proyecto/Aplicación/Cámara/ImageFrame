@@ -1,0 +1,119 @@
+package com.example.robotcontrolapplabi.capture;
+
+import android.graphics.Color;
+
+import android.util.Log;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+
+
+public class ImageFrame {
+
+    private Pixel[][] pixelMatrix;
+    private int lineIndex;
+    private int colIndex;
+    private Runnable lineCaptured;
+
+    public ImageFrame(int width, int height, Runnable lineCaptured) {
+        pixelMatrix = new Pixel[height][width];
+        this.lineCaptured = lineCaptured;
+        this.lineIndex = 0;
+        this.colIndex = 0;
+    }
+
+    public void newLine() {
+        Log.d("ImageFrame", "Línea completada: " + lineIndex);
+        lineCaptured.run();
+
+        if (lineIndex < getLineCount() - 1) {
+            lineIndex++;
+        } else {
+            lineIndex = 0;
+        }
+
+        colIndex = 0;
+    }
+
+
+    public void addPixels(List<Pixel> pixels) {
+        for (Pixel pixel : pixels) {
+            addPixel(pixel);
+        }
+    }
+
+    public void addPixel(Pixel pixel) {
+        if (lineIndex < pixelMatrix.length) {
+            if (colIndex < pixelMatrix[lineIndex].length) {
+                pixelMatrix[lineIndex][colIndex] = pixel;
+                colIndex++;
+                android.util.Log.d("ImageFrame", "Pixel agregado en línea: " + lineIndex + " columna: " + colIndex);
+            }
+        }
+        if (colIndex >= pixelMatrix[lineIndex].length) {
+            newLine();
+        }
+    }
+
+
+    public int getLineLength() {
+        return pixelMatrix.length > 0 ? pixelMatrix[0].length : 0;
+    }
+
+    public int getLineCount() {
+        return pixelMatrix.length;
+    }
+
+    public int getCurrentLineIndex() {
+        return lineIndex;
+    }
+
+    public int getCurrentColIndex() {
+        return colIndex;
+    }
+
+    public int getPixelColor(int x, int y) {
+        Pixel pixel = getPixel(x, y);
+        if (pixel != null) {
+            if (pixel.hasInvalidColors()) {
+                fixPixel(pixel, x, y);
+            }
+            return pixel.getColor();
+        } else {
+            return Color.BLACK;
+        }
+    }
+
+    private void fixPixel(Pixel pixel, int x, int y) {
+        Collection<Pixel> surroundingPixels = new ArrayList<>();
+        Pixel topPixel = getPixel(x, y - 1);
+        if (topPixel != null) surroundingPixels.add(topPixel);
+        Pixel bottomPixel = getPixel(x, y + 1);
+        if (bottomPixel != null) surroundingPixels.add(bottomPixel);
+        Pixel leftPixel = getPixel(x - 1, y);
+
+        if (leftPixel != null) surroundingPixels.add(leftPixel);
+        Pixel rightPixel = getPixel(x + 1, y);
+        if (rightPixel != null) surroundingPixels.add(rightPixel);
+        pixel.fixColors(surroundingPixels);
+    }
+
+    private Pixel getPixel(int x, int y) {
+        return x >= 0 && x < getLineLength() &&
+                y >= 0 && y < getLineCount() ? pixelMatrix[y][x] : null;
+    }
+    public boolean isComplete() {
+        return lineIndex >= getLineCount();
+    }
+    public void clear() {
+        for (int y = 0; y < pixelMatrix.length; y++) {
+            for (int x = 0; x < pixelMatrix[y].length; x++) {
+                pixelMatrix[y][x] = null;
+            }
+        }
+        lineIndex = 0;
+        colIndex = 0;
+    }
+
+}
