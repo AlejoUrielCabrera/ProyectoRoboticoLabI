@@ -1,0 +1,566 @@
+package com.example.robotcontrolapplabi
+
+import android.Manifest
+import android.app.AlertDialog
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothSocket
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.widget.*
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import com.example.robotcontrolapplabi.capture.ImageCapture
+import com.example.robotcontrolapplabi.capture.ImageFrame
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.*
+import java.util.concurrent.Executors
+import android.graphics.Canvas
+import android.graphics.Paint
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+
+class MainActivity : AppCompatActivity(), ImageCapture.ImageCaptured, ImageCapture.DebugData {
+
+    // UI
+    private lateinit var btnConnect: Button
+    private lateinit var txtStatus: TextView
+    private lateinit var imageViewCamera: ImageView
+
+    private lateinit var btnForward: Button
+    private lateinit var btnBackward: Button
+    private lateinit var btnLeft: Button
+    private lateinit var btnRight: Button
+    private lateinit var btnStop: Button
+    private lateinit var btnEnterImageMode: Button
+    private lateinit var btnExitImageMode: Button
+
+    // Bluetooth
+    private var bluetoothAdapter: BluetoothAdapter? = null
+    private var bluetoothSocket: BluetoothSocket? = null
+    private var outputStream: OutputStream? = null
+    private var inputStream: InputStream? = null
+    private var connectedDevice: BluetoothDevice? = null
+
+
+    // Estado
+    private var isImageMode = false
+    private val handler = Handler(Looper.getMainLooper())
+    private val lineBuffer = java.io.ByteArrayOutputStream()
+
+    private var imageCapture: ImageCapture? = null
+    private var imageListeningThread: Thread? = null
+
+    private val imageProcessingExecutor = Executors.newSingleThreadExecutor()
+
+    private var persistentBitmap: Bitmap? = null
+    private var persistentCanvas: Canvas? = null
+    private val paint = Paint()
+
+    private var imageWidth = 160  // cambia por el ancho real que recibas
+    private var imageHeight = 120 // cambia por el alto real que recibas
+
+    private val FRAME_START: Byte = 0x02
+    private val FRAME_END: Byte = 0x03
+    private var receivingFrame = false
+    private val frameBuffer = ByteArrayOutputStream()
+
+    companion object {
+        private const val BLUETOOTH_PERMISSION_REQUEST_CODE = 1
+        private const val TAG = "MainActivity"
+        private const val BT_IMAGE_TAG = "BluetoothImage"
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        checkBluetoothPermissions()
+
+        // UI
+        btnConnect = findViewById(R.id.btnConnect)
+        txtStatus = findViewById(R.id.txtStatus)
+        imageViewCamera = findViewById(R.id.imageViewCamera)
+
+        btnForward = findViewById(R.id.btnForward)
+        btnBackward = findViewById(R.id.btnBackward)
+        btnLeft = findViewById(R.id.btnLeft)
+        btnRight = findViewById(R.id.btnRight)
+        btnStop = findViewById(R.id.btnStop)
+        btnEnterImageMode = findViewById(R.id.btnEnterImageMode)
+        btnExitImageMode = findViewById(R.id.btnExitImageMode)
+
+        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+        if (bluetoothAdapter == null) {
+            Toast.makeText(this, "Bluetooth no está disponible.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        btnConnect.setOnClickListener { showDeviceList() }
+
+        // Control
+        btnForward.setOnClickListener { sendCommand("F") }
+        btnBackward.setOnClickListener { sendCommand("B") }
+        btnLeft.setOnClickListener { sendCommand("L") }
+        btnRight.setOnClickListener { sendCommand("R") }
+        btnStop.setOnClickListener { sendCommand("S") }
+
+        // Modo imagen
+        btnEnterImageMode.setOnClickListener {
+            if (bluetoothSocket?.isConnected == true && inputStream != null) {
+                isImageMode = true
+                clearInputStream() // Limpiá cualquier residuo viejo
+                sendCommand("IMG")
+                handler.postDelayed({
+                    startListening()
+                }, 300)
+
+
+
+                txtStatus.text = "Modo imagen ACTIVADO"
+
+                // Inicializar bitmap y canvas persistentes
+                persistentBitmap = Bitmap.createBitmap(imageWidth, imageHeight, Bitmap.Config.RGB_565)
+                persistentCanvas = Canvas(persistentBitmap!!)
+                imageViewCamera.setImageBitmap(persistentBitmap)
+
+                imageCapture = ImageCapture(this, this,)
+                Log.d(TAG, "Modo imagen activado.")
+                setControlButtonsEnabled(false)
+            } else {
+                Toast.makeText(this, "Conéctate primero al dispositivo Bluetooth.", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        btnExitImageMode.setOnClickListener {
+            if (isImageMode) {
+
+                isImageMode = false
+                sendCommand("STOPIMG")
+                txtStatus.text = "Modo imagen DESACTIVADO"
+                handler.postDelayed({
+                    clearInputStream()
+                }, 500)
+
+                clearImageBuffersAndState()
+
+                // Detiene el hilo de escucha de imagen
+                try {
+                    imageListeningThread?.join(500)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error al detener hilo de imagen: ${e.message}", e)
+                }
+                imageListeningThread = null
+
+                // 🔴 Limpia la referencia a ImageCapture
+                imageCapture = null
+
+                // 🔴 Limpia el bitmap y canvas persistentes
+                persistentBitmap = null
+                persistentCanvas = null
+
+                // 🔴 Borra la imagen en pantalla
+                imageViewCamera.setImageBitmap(null)
+                imageViewCamera.invalidate()
+
+                // 🔴 Vuelve a habilitar los botones de control de conducción
+                setControlButtonsEnabled(true)
+
+                Log.d(TAG, "Modo imagen desactivado, recursos limpiados y controles reactivados.")
+                // Cerrar el socket actual para liberar el stream bloqueado
+                try {
+                    bluetoothSocket?.close()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error al cerrar el socket", e)
+                }
+                bluetoothSocket = null
+                inputStream = null
+                outputStream = null
+
+                // 🔴 Reconectar automáticamente
+                reconnectToDevice()
+            }
+        }
+
+
+    }
+
+    // -------------- Bluetooth ----------------
+
+    private fun showDeviceList() {
+        val pairedDevices: Set<BluetoothDevice>? = try {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                bluetoothAdapter?.bondedDevices
+            } else {
+                Log.w(TAG, "Permiso BLUETOOTH_CONNECT no concedido.")
+                null
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException al acceder a bondedDevices", e)
+            null
+        }
+
+        if (pairedDevices.isNullOrEmpty()) {
+            Toast.makeText(this, "No hay dispositivos Bluetooth emparejados.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val deviceNames = pairedDevices.map { "${it.name}\n${it.address}" }.toTypedArray()
+        val deviceArray = pairedDevices.toTypedArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Elige tu dispositivo Bluetooth")
+            .setItems(deviceNames) { _, which ->
+                connectToDevice(deviceArray[which])
+            }
+            .show()
+    }
+
+    private fun connectToDevice(device: BluetoothDevice) {
+        txtStatus.text = "Conectando a ${device.name}..."
+        Thread {
+            try {
+                try {
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED ||
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_ADMIN) == PackageManager.PERMISSION_GRANTED) {
+                        bluetoothAdapter?.cancelDiscovery()
+                    } else {
+                        Log.w(TAG, "No se tiene permiso para cancelar discovery.")
+                    }
+                } catch (e: SecurityException) {
+                    Log.e(TAG, "SecurityException al cancelar discovery", e)
+                }
+
+                val sppUuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+                bluetoothSocket = try {
+                    device.createRfcommSocketToServiceRecord(sppUuid)
+                } catch (e: SecurityException) {
+                    Log.e(TAG, "SecurityException al crear el socket", e)
+                    null
+                }
+
+                bluetoothSocket?.connect()
+                connectedDevice = device
+                outputStream = bluetoothSocket?.outputStream
+                inputStream = bluetoothSocket?.inputStream
+
+                runOnUiThread {
+                    txtStatus.text = "Conectado a ${device.name}"
+                    Toast.makeText(this, "Conexión exitosa", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error al conectar: ${e.message}", e)
+                runOnUiThread {
+                    txtStatus.text = "Error al conectar"
+                    Toast.makeText(this, "Error al conectar: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+                try {
+                    bluetoothSocket?.close()
+                } catch (_: Exception) {}
+                bluetoothSocket = null
+            }
+        }.start()
+    }
+
+    private fun sendCommand(command: String) {
+        try {
+            outputStream?.write((command + "\n").toByteArray(Charsets.UTF_8))
+            outputStream?.flush()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error enviando comando: ${e.message}", e)
+            runOnUiThread {
+                txtStatus.text = "Error enviando comando"
+            }
+        }
+    }
+
+    private fun startListening() {
+        clearInputStream()
+        imageListeningThread = Thread {
+            try {
+                val buffer = ByteArray(1024)
+                while (isImageMode && bluetoothSocket?.isConnected == true && inputStream != null) {
+                    val bytesRead = inputStream!!.read(buffer)
+                    if (bytesRead > 0) {
+                        onBytesReceivedFromBluetooth(buffer.copyOfRange(0, bytesRead))
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(BT_IMAGE_TAG, "Error escuchando datos: ${e.message}", e)
+                runOnUiThread { txtStatus.text = "Error en modo imagen" }
+            } finally {
+                Log.d(BT_IMAGE_TAG, "Escucha finalizada.")
+            }
+        }
+        imageListeningThread?.start()
+    }
+
+
+
+    // ---------------- Permisos ----------------
+
+    private fun checkBluetoothPermissions() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            val permissions = mutableListOf<String>()
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (permissions.isNotEmpty()) {
+                ActivityCompat.requestPermissions(this, permissions.toTypedArray(), BLUETOOTH_PERMISSION_REQUEST_CODE)
+            }
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == BLUETOOTH_PERMISSION_REQUEST_CODE) {
+            if (grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                Toast.makeText(this, "Permisos Bluetooth concedidos.", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Permisos Bluetooth denegados.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    // ---------------- Callbacks de ImageCapture ----------------
+
+    override fun imageCaptured(imageFrame: ImageFrame?, lineNumber: Int?) {
+        if (imageFrame == null || lineNumber == null) return
+
+        handler.post {
+            try {
+                val y = lineNumber
+                val w = imageFrame.lineLength
+                for (x in 0 until w) {
+                    paint.color = imageFrame.getPixelColor(x, y)
+                    persistentCanvas?.drawPoint(x.toFloat(), y.toFloat(), paint)
+                }
+
+                // Solo refrescar cada 10 líneas o en la última
+                if (y % 10 == 0 || y == imageHeight - 1) {
+                    imageViewCamera.invalidate()
+                }
+            } catch (e: Exception) {
+                Log.e(BT_IMAGE_TAG, "Error en imageCaptured: ${e.message}", e)
+            }
+        }
+    }
+
+
+
+
+    override fun debugDataReceived(text: String?) {
+        Log.d(BT_IMAGE_TAG, "DEBUG: $text")
+    }
+
+    // ---------------- Mostrar imagen ----------------
+
+    private fun showImage(frame: ImageFrame, lineIndex: Int?) {
+        imageProcessingExecutor.execute {
+            try {
+                val w = frame.lineLength
+                val h = frame.lineCount
+                val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565)
+                val canvas = Canvas(bitmap)
+                val paint = Paint()
+
+                val fromLine = lineIndex ?: 0
+                val toLine = lineIndex ?: (h - 1)
+
+                for (y in fromLine..toLine) {
+                    for (x in 0 until w) {
+                        paint.color = frame.getPixelColor(x, y)
+                        canvas.drawPoint(x.toFloat(), y.toFloat(), paint)
+                    }
+                }
+
+                handler.post {
+                    imageViewCamera.setImageBitmap(bitmap)
+                    imageViewCamera.invalidate()
+                    Log.d(BT_IMAGE_TAG, "Imagen mostrada con tamaño ${w}x${h}")
+                }
+
+            } catch (e: Exception) {
+                Log.e(BT_IMAGE_TAG, "Error mostrando imagen: ${e.message}", e)
+                handler.post {
+                    Toast.makeText(this, "Error mostrando imagen.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Log.d(TAG, "onDestroy llamado.")
+        isImageMode = false
+        try {
+            inputStream?.close()
+            outputStream?.close()
+            bluetoothSocket?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error al cerrar recursos Bluetooth en onDestroy", e)
+        }
+        bluetoothSocket = null
+        inputStream = null
+        outputStream = null
+        imageProcessingExecutor.shutdownNow()
+    }
+
+    fun onBytesReceivedFromBluetooth(bytes: ByteArray) {
+        for (b in bytes) {
+            when (b) {
+                FRAME_START -> {
+                    receivingFrame = true
+                    frameBuffer.reset()
+                }
+                FRAME_END -> {
+                    if (receivingFrame) {
+                        receivingFrame = false
+                        val frameData = frameBuffer.toByteArray()
+                        if (isValidFrame(frameData)) {
+                            imageCapture?.addReceivedBytes(frameData)
+                        } else {
+                            Log.w(TAG, "Frame inválido descartado.")
+                        }
+                        frameBuffer.reset()
+                    } else {
+                        // ERROR: Recibimos END sin START => descartamos
+                        Log.w(TAG, "FRAME_END sin FRAME_START")
+                        frameBuffer.reset()
+                    }
+                }
+                else -> {
+                    if (receivingFrame) {
+                        frameBuffer.write(b.toInt())
+                    } else {
+                        // No estamos en frame. Ignorar ruidos.
+                    }
+                }
+            }
+        }
+    }
+
+    fun isValidFrame(data: ByteArray): Boolean {
+        // Por ejemplo, exigir un tamaño mínimo
+        return data.size >= (imageWidth)
+    }
+
+
+
+    fun setControlButtonsEnabled(enabled: Boolean) {
+        btnForward.isEnabled = enabled
+        btnBackward.isEnabled = enabled
+        btnLeft.isEnabled = enabled
+        btnRight.isEnabled = enabled
+        btnStop.isEnabled = enabled
+    }
+
+    private fun clearImageBuffersAndState() {
+        frameBuffer.reset()     // Buffer de bytes recibidos entre FRAME_START y FRAME_END
+        lineBuffer.reset()      // Otro buffer que usas para líneas (si lo usas)
+        imageCapture?.clear()   // Limpia estado interno de ImageCapture (pixelBytes, comandos, imagen)
+    }
+
+    fun clearInputStream() {
+        try {
+            var cleared = 0
+            while (inputStream != null && inputStream!!.available() > 0 && cleared < 1024) {
+                val discarded = inputStream!!.read()
+                cleared++
+                Log.d(TAG, "Descartando byte residual: $discarded")
+            }
+            Log.d(TAG, "Limpiados $cleared bytes residuales")
+        } catch (e: IOException) {
+            Log.e(TAG, "Error limpiando inputStream", e)
+        }
+    }
+
+    private fun reconnectToDevice() {
+        val device = connectedDevice
+        if (device == null) {
+            Log.w(TAG, "No hay dispositivo guardado para reconectar")
+            runOnUiThread {
+                txtStatus.text = "No hay dispositivo para reconectar"
+            }
+            return
+        }
+
+        val deviceName = if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            device.name ?: "Dispositivo"
+        } else {
+            "Dispositivo"
+        }
+
+        txtStatus.text = "Reconectando a $deviceName..."
+
+        Thread {
+            val sppUuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+            var attempt = 1
+            var connected = false
+            var lastError: Exception? = null
+
+            while (attempt <= 3 && !connected) {
+                Log.d(TAG, "Intento de reconexión #$attempt")
+                try {
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+                        == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        bluetoothSocket = device.createRfcommSocketToServiceRecord(sppUuid)
+                    } else {
+                        Log.w(TAG, "Permiso BLUETOOTH_CONNECT no concedido. No se pudo crear el socket.")
+                        bluetoothSocket = null
+                    }
+
+                    bluetoothSocket?.connect()
+                    outputStream = bluetoothSocket?.outputStream
+                    inputStream = bluetoothSocket?.inputStream
+
+                    runOnUiThread {
+                        clearInputStream()
+                        clearImageBuffersAndState()
+                        txtStatus.text = "Reconectado a $deviceName (intento $attempt)"
+                        Toast.makeText(this, "Reconexión exitosa", Toast.LENGTH_SHORT).show()
+                    }
+
+                    sendCommand("STOPIMG")
+                    connected = true
+
+                } catch (e: Exception) {
+                    lastError = e
+                    Log.e(TAG, "Error en intento de reconexión #$attempt: ${e.message}", e)
+
+                    // Cerrar socket en caso de error
+                    try {
+                        bluetoothSocket?.close()
+                    } catch (closeErr: Exception) {
+                        Log.e(TAG, "Error al cerrar el socket tras fallo de reconexión", closeErr)
+                    }
+                    bluetoothSocket = null
+
+                    // Esperar un poco antes de intentar de nuevo
+                    Thread.sleep(1000)
+                    attempt++
+                }
+            }
+
+            if (!connected) {
+                Log.e(TAG, "Fallo tras 3 intentos de reconexión")
+                runOnUiThread {
+                    txtStatus.text = "Error al reconectar"
+                    Toast.makeText(this, "Error al reconectar: ${lastError?.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+}
