@@ -1,0 +1,25 @@
+package com.example.robotcontrolapplabi.capture;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+
+public class CommandDebugDataAction {
+
+    private ImageCapture imageCapture;
+    private byte[] commandData;
+    private int commandDataLength;
+
+    public CommandDebugDataAction(ImageCapture imageCapture, byte[] commandData, int commandDataLength) {
+        this.imageCapture = imageCapture;
+        this.commandData = commandData;
+        this.commandDataLength = commandDataLength;
+    }
+
+    public void process() {
+        if (commandDataLength > 0) {
+            // Copiamos desde índice 1 porque el byte 0 es el código de comando
+            String debugText = new String(Arrays.copyOfRange(commandData, 1, commandDataLength), StandardCharsets.UTF_8);
+            imageCapture.printDebugData(debugText);
+        }
+    }
+}
